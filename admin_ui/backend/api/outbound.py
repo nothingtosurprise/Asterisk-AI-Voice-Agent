@@ -91,12 +91,18 @@ class RecordingRow(BaseModel):
 
 
 def _find_media_ulaw_path(base: str) -> Optional[str]:
-    """Resolve a `sound:ai-generated/<base>` file to an on-disk .ulaw path (case-insensitive suffix)."""
+    """Resolve a media basename while preserving basename case."""
     media_dir = _media_dir()
-    target_name = f"{base}.ulaw"
     try:
-        for entry in os.listdir(media_dir):
-            if entry.lower() != target_name.lower():
+        entries = os.listdir(media_dir)
+        exact_name = f"{base}.ulaw"
+        exact_path = os.path.join(media_dir, exact_name)
+        if exact_name in entries and os.path.isfile(exact_path):
+            return exact_path
+
+        for entry in entries:
+            stem, suffix = os.path.splitext(entry)
+            if stem != base or suffix.lower() != ".ulaw":
                 continue
             full_path = os.path.join(media_dir, entry)
             if os.path.isfile(full_path):
