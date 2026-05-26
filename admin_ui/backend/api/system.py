@@ -3719,9 +3719,25 @@ def _run_updater_ephemeral(
                 detach=True,
             )
 
-        result = container.wait(timeout=timeout_sec)
-        status = int((result or {}).get("StatusCode", 1))
-        logs = (container.logs(stdout=True, stderr=capture_stderr) or b"").decode("utf-8", errors="replace")
+        wait_error: Optional[Exception] = None
+        status = 1
+        try:
+            result = container.wait(timeout=timeout_sec)
+            status = int((result or {}).get("StatusCode", 1))
+        except Exception as e:
+            # Treat wait timeout/transport issues as a controlled non-zero exit so callers can degrade gracefully.
+            wait_error = e
+            status = 124
+
+        try:
+            logs = (container.logs(stdout=True, stderr=capture_stderr) or b"").decode("utf-8", errors="replace")
+        except Exception as log_err:
+            logs = f"[updater] Failed to read logs: {_sanitize_for_log(str(log_err))}"
+
+        if wait_error is not None:
+            extra = f"[updater] Wait failed: {_sanitize_for_log(str(wait_error))}"
+            logs = f"{logs.rstrip()}\n{extra}" if logs else extra
+
         return status, logs
     finally:
         try:
@@ -3995,6 +4011,8 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
             allow_build=bool(build_updater),
         )
     except HTTPException:
+        code2, out2 = 1, ""
+    except Exception:
         code2, out2 = 1, ""
     if code2 != 0:
         payload = {
