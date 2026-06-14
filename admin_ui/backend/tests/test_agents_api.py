@@ -283,6 +283,54 @@ def test_aggregate_endpoints_resilient_to_missing_table(tmp_path, monkeypatch):
     assert r.json() == []
 
 
+def test_create_pipeline_only_agent_no_provider_key(client):
+    r = client.post("/api/agents", json={
+        "display_name": "NoPK", "prompt": "p",
+        "extra_json": '{"pipeline": "local_hybrid"}'})
+    assert r.status_code == 201
+    assert r.json()["provider"] == ""
+
+def test_create_pipeline_only_agent_succeeds(client):
+    r = client.post("/api/agents", json={
+        "display_name": "Hybrid", "provider": "", "prompt": "p",
+        "extra_json": '{"pipeline": "local_hybrid"}'})
+    assert r.status_code == 201, r.text
+    assert r.json()["provider"] == ""
+
+def test_create_without_provider_or_pipeline_rejected(client):
+    r = client.post("/api/agents", json={
+        "display_name": "Nope", "provider": "", "prompt": "p"})
+    assert r.status_code == 422
+
+def test_create_with_provider_still_works(client):
+    r = client.post("/api/agents", json={
+        "display_name": "Mono", "provider": "openai_realtime", "prompt": "p"})
+    assert r.status_code == 201
+
+def test_patch_clearing_provider_requires_pipeline(client):
+    client.post("/api/agents", json={
+        "display_name": "Edit Me", "provider": "openai_realtime", "prompt": "p"})
+    bad = client.patch("/api/agents/edit_me", json={"provider": "", "extra_json": "{}"})
+    assert bad.status_code == 422
+    ok = client.patch("/api/agents/edit_me",
+                       json={"provider": "", "extra_json": '{"pipeline": "local_hybrid"}'})
+    assert ok.status_code == 200 and ok.json()["provider"] == ""
+
+def test_patch_null_clears_json_columns(client):
+    # Pipeline-only agent: pipeline lives in extra_json, provider empty.
+    client.post("/api/agents", json={
+        "display_name": "Switcher", "provider": "", "prompt": "p",
+        "tools_json": '["transfer"]', "extra_json": '{"pipeline": "local_hybrid"}'})
+    # Switch to a monolithic provider and clear the JSON columns (the UI sends null).
+    r = client.patch("/api/agents/switcher", json={
+        "provider": "openai_realtime", "tools_json": None, "extra_json": None})
+    assert r.status_code == 200
+    row = r.json()
+    # The stale pipeline/tools must actually be gone — not silently retained.
+    assert row["provider"] == "openai_realtime"
+    assert row["extra_json"] in (None, "")
+    assert row["tools_json"] in (None, "")
+
 def test_reconcile_adds_new_yaml_context(client, tmp_path, monkeypatch):
     import yaml as _yaml
     from api import agents as agents_api
