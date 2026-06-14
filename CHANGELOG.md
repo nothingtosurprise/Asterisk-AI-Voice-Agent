@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Contributing section tone**: replaced the overpromising "AVA writes the code for you" opener in `README.md` with an honest description of non-code contribution paths. Softened matching "AVA writes the …" phrasings in `docs/ROADMAP.md` to "AVA helps you write the …" register.
 ### Security
 
 - **Config export no longer bundles `.env` by default**: The `/api/config/export` endpoint now excludes `.env` (which contains API keys and credentials) from the downloaded ZIP unless the caller passes `include_secrets=true`. An `EXPORT_README.txt` is always included in the archive listing what is and is not present. The Admin UI (ConfigEditor and RawYamlPage) exposes a checkbox "Include secrets (.env)" defaulting to unchecked, with an inline warning when checked.
