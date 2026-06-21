@@ -4,6 +4,7 @@ import { toast } from 'sonner';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
 import yaml from 'js-yaml';
 import { sanitizeConfigForSave } from '../utils/configSanitizers';
+import { getCachedConfig, loadConfigYaml } from '../utils/configCache';
 import { Plus, Settings, Trash2, Copy, ArrowRight, Workflow, AlertTriangle, AlertCircle, RefreshCw, Loader2 } from 'lucide-react';
 import { YamlErrorBanner, YamlErrorInfo } from '../components/ui/YamlErrorBanner';
 import { ConfigSection } from '../components/ui/ConfigSection';
@@ -15,10 +16,10 @@ import { usePendingChanges } from '../hooks/usePendingChanges';
 
 const PipelinesPage = () => {
     const { confirm } = useConfirmDialog();
-    const [config, setConfig] = useState<any>({});
-    const [loading, setLoading] = useState(true);
+    const [config, setConfig] = useState<any>(() => getCachedConfig()?.config ?? {});
+    const [loading, setLoading] = useState(() => getCachedConfig() == null);
     const [error, setError] = useState<string | null>(null);
-    const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(null);
+    const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(() => getCachedConfig()?.yamlError ?? null);
     const [editingPipeline, setEditingPipeline] = useState<string | null>(null);
     const [pipelineForm, setPipelineForm] = useState<any>({});
     const [isNewPipeline, setIsNewPipeline] = useState(false);
@@ -103,22 +104,17 @@ const PipelinesPage = () => {
     };
 
     useEffect(() => {
-        fetchConfig();
+        // Seed from cache (no "Loading…" flash on revisit); revalidate in the
+        // background so out-of-band edits from other pages still surface.
+        fetchConfig(getCachedConfig() != null);
     }, []);
 
-    const fetchConfig = async () => {
+    const fetchConfig = async (force = false) => {
         try {
-            const res = await axios.get('/api/config/yaml');
-            if (res.data.yaml_error) {
-                setYamlError(res.data.yaml_error);
-                setConfig({});
-                setError(null);
-            } else {
-                const parsed = yaml.load(res.data.content) as any;
-                setConfig(parsed || {});
-                setError(null);
-                setYamlError(null);
-            }
+            const r = await loadConfigYaml(force);
+            setConfig(r.config);
+            setYamlError(r.yamlError);
+            setError(null);
         } catch (err) {
             console.error('Failed to load config', err);
             const status = (err as any)?.response?.status;
