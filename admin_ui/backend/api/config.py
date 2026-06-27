@@ -29,6 +29,14 @@ def _is_prefix(key: str, prefixes: tuple[str, ...]) -> bool:
     return any(key.startswith(p) for p in prefixes)
 
 
+_LIVE_STATUS_PUBLISHER_KEYS = {
+    "LIVE_STATUS_ADMIN_URL",
+    "LIVE_STATUS_PUSH_TOKEN",
+    "LIVE_STATUS_PUSH_INTERVAL_SECONDS",
+    "LIVE_STATUS_PUSH_TIMEOUT_SECONDS",
+}
+
+
 def _running_container_names() -> set:
     """Return a set of container names that are currently running."""
     try:
@@ -91,13 +99,15 @@ def _ai_engine_env_key(key: str) -> bool:
         or _is_prefix(key, ("SMTP_",))
         # Local provider runtime uses these env vars via ${LOCAL_WS_*} placeholders in ai-agent.yaml
         or _is_prefix(key, ("LOCAL_WS_",))
+        or key in _LIVE_STATUS_PUBLISHER_KEYS
     )
 
 
 def _local_ai_env_key(key: str) -> bool:
     return (
         _is_prefix(key, ("LOCAL_", "KROKO_", "FASTER_WHISPER_", "WHISPER_CPP_", "MELOTTS_", "KOKORO_"))
-        or key in ("SHERPA_MODEL_PATH",)
+        or key in ("SHERPA_MODEL_PATH", "HEALTH_API_TOKEN")
+        or key in _LIVE_STATUS_PUBLISHER_KEYS
     )
 
 
@@ -109,8 +119,9 @@ def _admin_ui_env_key(key: str) -> bool:
     # admin_ui-impacting keys, which is honest signaling: changes affect this
     # service's runtime behavior. Refs #370.
     return (
-        key in ("JWT_SECRET", "DOCKER_SOCK", "DOCKER_GID", "TZ")
+        key in ("JWT_SECRET", "DOCKER_SOCK", "DOCKER_GID", "TZ", "HEALTH_API_TOKEN", "LIVE_STATUS_PUSH_TOKEN")
         or _is_prefix(key, ("UVICORN_", "ADMIN_UI_", "AAVA_HTTP_TOOL_TEST_"))
+        or key in ("LIVE_STATUS_POLL_INTERVAL_SECONDS", "LIVE_STATUS_INITIAL_PROBE_TIMEOUT_SECONDS")
     )
 
 
@@ -694,6 +705,12 @@ def persist_config_content(content: str) -> dict:
         "message": f"Configuration saved. {'Hot reload' if recommended_method == 'hot_reload' else 'Restart'} AI Engine to apply changes.",
         "warnings": warnings,
     }
+
+
+@router.get("")
+@router.get("/")
+async def get_config():
+    return _read_merged_config_dict()
 
 
 @router.post("/yaml")
