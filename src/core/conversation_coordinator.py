@@ -52,7 +52,13 @@ class NoInputWatchdogObserver(Protocol):
         """Observe the start of caller-facing output."""
         ...
 
-    async def note_agent_output_end(self, call_id: str, *, reset_timer: bool = True) -> None:
+    async def note_agent_output_end(
+        self,
+        call_id: str,
+        *,
+        reset_timer: bool = True,
+        preserve_policy_state: bool = False,
+    ) -> None:
         """Observe the end of caller-facing output."""
         ...
 
@@ -128,8 +134,15 @@ class ConversationCoordinator:
                     )
         return success
 
-    async def on_tts_end(self, call_id: str, playback_id: str, reason: str = "playback-finished") -> bool:
-        """Re-enable audio capture after a TTS playback finishes."""
+    async def on_tts_end(
+        self,
+        call_id: str,
+        playback_id: str,
+        reason: str = "playback-finished",
+        *,
+        notify_no_input: bool = True,
+    ) -> bool:
+        """Re-enable capture and optionally report caller-facing output completion."""
         logger.info(
             "🔊 ConversationCoordinator clearing gating",
             call_id=call_id,
@@ -147,7 +160,7 @@ class ConversationCoordinator:
             self._set_tts_gated(call_id, tts_gated)
             self._set_capture_enabled(call_id, bool(capture_enabled))
             self._barge_in_seen[call_id] = False
-            if self._no_input_watchdog and not tts_gated:
+            if notify_no_input and self._no_input_watchdog and not tts_gated:
                 try:
                     await self._no_input_watchdog.note_agent_output_end(call_id)
                 except Exception:

@@ -221,6 +221,35 @@ async def test_hosted_silence_output_pauses_without_resetting_deadline():
 
 
 @pytest.mark.asyncio
+async def test_self_announcement_drain_completion_preserves_grace_state():
+    watchdog = NoInputWatchdog(AsyncMock(return_value=True), AsyncMock())
+    policy = NoInputPolicy(initial_timeout_sec=30.0, grace_timeout_sec=15.0, max_check_ins=1)
+    await watchdog.register("call-self-announcement", policy, is_outbound=False)
+    try:
+        await watchdog.mark_ready("call-self-announcement")
+        state = watchdog._states["call-self-announcement"]
+        state.output_active = True
+        state.self_announcement = False
+        state.phase = "grace"
+        state.check_ins = 1
+        state.deadline = 1234.5
+
+        await watchdog.note_agent_output_end(
+            "call-self-announcement",
+            reset_timer=True,
+            preserve_policy_state=True,
+        )
+
+        snapshot = watchdog.snapshot("call-self-announcement")
+        assert snapshot["output_active"] is False
+        assert snapshot["phase"] == "grace"
+        assert snapshot["check_ins"] == 1
+        assert snapshot["deadline"] == 1234.5
+    finally:
+        await watchdog.stop("call-self-announcement")
+
+
+@pytest.mark.asyncio
 async def test_raw_audio_detector_ignores_audio_during_native_provider_output():
     engine = Engine.__new__(Engine)
     engine.no_input_watchdog = SimpleNamespace(
@@ -242,6 +271,110 @@ async def test_raw_audio_detector_ignores_audio_during_native_provider_output():
     )
 
     engine.no_input_watchdog.note_input_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_input_provider_output_drains_without_resetting_policy_state():
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine._call_bg_tasks = {}
+    engine._provider_output_operations = {}
+    engine._provider_output_drain_tasks = {}
+    engine._agent_output_active_calls = set()
+    engine.config = SimpleNamespace(audio_transport="audiosocket")
+    engine.no_input_watchdog = SimpleNamespace(
+        note_agent_output_start=AsyncMock(),
+        note_agent_output_end=AsyncMock(),
+    )
+    engine._save_session = AsyncMock()
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+
+    async def wait_for_drain(_call_id, **_kwargs):
+        drain_started.set()
+        await release_drain.wait()
+        return True
+
+    engine._wait_for_call_audio_drain = wait_for_drain
+    session = CallSession(
+        call_id="call-provider-tail",
+        caller_channel_id="channel-provider-tail",
+    )
+    await engine.session_store.upsert_call(session)
+    engine._provider_output_operations[session.call_id] = {
+        "output_id": "no-input-check-in",
+        "purpose": "no_input_check_in",
+        "audio_started": asyncio.Event(),
+        "generation_done": asyncio.Event(),
+    }
+
+    await engine._note_provider_output_start(session.call_id)
+    await engine._note_provider_output_end(session.call_id, session)
+    await asyncio.wait_for(drain_started.wait(), timeout=0.2)
+
+    assert session.call_id in engine._agent_output_active_calls
+    engine.no_input_watchdog.note_agent_output_end.assert_not_awaited()
+
+    release_drain.set()
+    await _wait_until(lambda: session.call_id not in engine._agent_output_active_calls)
+    engine.no_input_watchdog.note_agent_output_end.assert_awaited_once_with(
+        session.call_id,
+        reset_timer=True,
+        preserve_policy_state=True,
+    )
+
+    await engine._note_provider_output_end(session.call_id, session)
+    assert engine.no_input_watchdog.note_agent_output_end.await_count == 2
+    assert engine.no_input_watchdog.note_agent_output_end.await_args.kwargs == {
+        "reset_timer": True,
+        "preserve_policy_state": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_new_provider_audio_cancels_stale_drain_without_clearing_output_state():
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine._call_bg_tasks = {}
+    engine._provider_output_operations = {}
+    engine._provider_output_drain_tasks = {}
+    engine._agent_output_active_calls = set()
+    engine.config = SimpleNamespace(audio_transport="externalmedia")
+    engine.no_input_watchdog = SimpleNamespace(
+        note_agent_output_start=AsyncMock(),
+        note_agent_output_end=AsyncMock(),
+    )
+    engine._save_session = AsyncMock()
+    drain_started = asyncio.Event()
+    hold_drain = asyncio.Event()
+
+    async def wait_for_drain(_call_id, **_kwargs):
+        drain_started.set()
+        await hold_drain.wait()
+        return True
+
+    engine._wait_for_call_audio_drain = wait_for_drain
+    session = CallSession(
+        call_id="call-overlapping-output",
+        caller_channel_id="channel-overlapping-output",
+    )
+    await engine.session_store.upsert_call(session)
+
+    await engine._note_provider_output_start(session.call_id)
+    await engine._note_provider_output_end(session.call_id, session)
+    await asyncio.wait_for(drain_started.wait(), timeout=0.2)
+    stale_task = engine._provider_output_drain_tasks[session.call_id]
+
+    await engine._note_provider_output_end(session.call_id, session)
+    assert engine._provider_output_drain_tasks[session.call_id] is stale_task
+
+    await engine._note_provider_output_start(session.call_id)
+    await asyncio.sleep(0)
+
+    assert stale_task.cancelled() or stale_task.done()
+    assert session.call_id in engine._agent_output_active_calls
+    assert session.call_id not in engine._provider_output_drain_tasks
+    engine.no_input_watchdog.note_agent_output_end.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -267,6 +400,36 @@ async def test_watchdog_observer_failure_does_not_break_tts_gating():
 
     assert await coordinator.on_tts_end("call-observer-failure", "playback-1") is True
     after = await session_store.get_by_call_id("call-observer-failure")
+    assert after.tts_playing is False
+    assert after.audio_capture_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_transport_gating_can_end_without_ending_provider_output_timing():
+    session_store = SessionStore()
+    session = CallSession(
+        call_id="call-provider-drain-gating",
+        caller_channel_id="channel-provider-drain-gating",
+    )
+    await session_store.upsert_call(session)
+    watchdog = SimpleNamespace(
+        note_agent_output_start=AsyncMock(),
+        note_agent_output_end=AsyncMock(),
+    )
+    coordinator = ConversationCoordinator(session_store)
+    coordinator.set_no_input_watchdog(watchdog)
+
+    assert await coordinator.on_tts_start(session.call_id, "stream-1") is True
+    assert await coordinator.on_tts_end(
+        session.call_id,
+        "stream-1",
+        reason="provider-generation-complete",
+        notify_no_input=False,
+    ) is True
+
+    watchdog.note_agent_output_start.assert_awaited_once_with(session.call_id)
+    watchdog.note_agent_output_end.assert_not_awaited()
+    after = await session_store.get_by_call_id(session.call_id)
     assert after.tts_playing is False
     assert after.audio_capture_enabled is True
 
