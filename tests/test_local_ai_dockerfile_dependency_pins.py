@@ -22,9 +22,19 @@ def test_optional_native_dependency_pins_have_one_source_of_truth() -> None:
     for dockerfile in DOCKERFILES:
         content = dockerfile.read_text(encoding="utf-8")
         assert "COPY requirements.txt ." in content, dockerfile
-        assert "grep -m 1 '^sherpa-onnx' requirements.txt" in content, dockerfile
+        assert "grep -m 1 '^sherpa-onnx==' requirements.txt" in content, dockerfile
         assert 'pip install --no-cache-dir "$SHERPA_REQUIREMENT"' in content, dockerfile
-        assert "grep -m 1 '^llama-cpp-python' requirements.txt" in content, dockerfile
+        assert re.search(
+            r'echo "❌ INCLUDE_SHERPA=true but requirements\.txt has no '
+            r'sherpa-onnx entry" >&2; \\\s*exit 1;',
+            content,
+        ), dockerfile
+        assert "grep -m 1 '^llama-cpp-python==' requirements.txt" in content, dockerfile
         assert 'pip install --no-cache-dir "$LLAMA_CPP_REQUIREMENT"' in content, dockerfile
+        assert re.search(
+            r'echo "❌ INCLUDE_LLAMA=true but requirements\.txt has no '
+            r'llama-cpp-python entry" >&2; \\\s*exit 1;',
+            content,
+        ), dockerfile
         assert not re.search(r"pip install[^\n]*sherpa-onnx==", content), dockerfile
         assert not re.search(r"pip install[^\n]*llama-cpp-python==", content), dockerfile
