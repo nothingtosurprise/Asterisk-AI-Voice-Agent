@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.4.0] - 2026-07-16
+
 ### Added
 
 - **Agent-scoped resource access for transfer, Google Calendar, Microsoft Calendar, and voicemail** (`tool_configs_json`, Agents editor, immutable call snapshots): each Agent may inherit the applicable global inventory, allow selected destination/calendar/account/mailbox keys, or deny access. Empty or stale selections fail closed; global hard disables win. The same effective configuration drives schemas, prompt guidance, execution, deferred transfer, and audit metadata. Legacy single-calendar/account and `tools.leave_voicemail.extension` configurations materialize as compatible `default` resources; legacy calendar selections are promoted during migration.
@@ -2215,7 +2217,11 @@ Version 4.1 introduces **unified tool calling architecture** enabling AI agents 
 - **v4.0.0** (2025-10-29) - Modular pipeline architecture, production monitoring, golden baselines
 - **v3.0.0** (2025-09-16) - Modular pipeline architecture, file based playback
 
-[Unreleased]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v7.3.2...HEAD
+[Unreleased]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.4.0...HEAD
+[7.4.0]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.3.5...v7.4.0
+[7.3.5]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.3.4...v7.3.5
+[7.3.4]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.3.3...v7.3.4
+[7.3.3]: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/compare/v7.3.2...v7.3.3
 [7.3.2]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v7.3.1...v7.3.2
 [7.3.1]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v7.3.0...v7.3.1
 [7.3.0]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v7.2.1...v7.3.0
