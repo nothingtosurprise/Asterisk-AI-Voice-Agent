@@ -1,4 +1,5 @@
 import re
+import subprocess
 from pathlib import Path
 
 
@@ -105,6 +106,59 @@ def test_updater_resolves_worktree_gitdirs_before_scanning_ownership() -> None:
     assert ownership_scan in scan_loop
     assert drop_body.index(worktree_gitdir) < loop_start
     assert drop_body.index(common_gitdir) < loop_start
+
+
+def test_updater_fails_closed_on_mixed_owned_tracked_paths_only() -> None:
+    runner = (ROOT / "updater" / "run.sh").read_text(encoding="utf-8")
+    drop_body = _drop_to_project_owner_body(runner)
+
+    assert 'ls-files -z >"${tracked_list}"' in drop_body
+    assert 'tracked_path="${PROJECT_ROOT}/${tracked_relative}"' in drop_body
+    assert 'tracked_parent="${tracked_path%/*}"' in drop_body
+    assert 'tracked_parent="${tracked_parent%/*}"' in drop_body
+    assert 'dirname "${tracked_path}"' not in drop_body
+    assert '[ -L "${tracked_parent}" ]' in drop_body
+    assert 'tracked parent ${tracked_parent} is a symlink' in drop_body
+    assert '[ -e "${tracked_parent}" ]' in drop_body
+    assert drop_body.index('[ -L "${tracked_parent}" ]') < drop_body.index(
+        'stat -c \'%u\' "${tracked_parent}"'
+    )
+    assert drop_body.index('[ -L "${tracked_parent}" ]') < drop_body.index(
+        'stat -c \'%u\' "${tracked_path}"'
+    )
+    assert "differs from tracked path owner UID" in drop_body
+    assert "differs from tracked parent owner UID" in drop_body
+    assert "untracked runtime/operator data is intentionally out" in drop_body
+    assert 'find "${PROJECT_ROOT}"' not in drop_body
+
+
+def test_updater_normalizes_project_root_without_losing_path_bytes() -> None:
+    runner = (ROOT / "updater" / "run.sh").read_text(encoding="utf-8")
+
+    assert '[ "${PROJECT_ROOT%/}" != "${PROJECT_ROOT}" ]' in runner
+    assert 'PROJECT_ROOT="${PROJECT_ROOT%/}"' in runner
+    assert 'PROJECT_ROOT="$(realpath' not in runner
+
+
+def test_shell_parent_walk_preserves_newlines_and_terminates() -> None:
+    script = r'''set -euo pipefail
+PROJECT_ROOT=/tmp/aava-repo///
+while [ "${PROJECT_ROOT}" != "/" ] && [ "${PROJECT_ROOT%/}" != "${PROJECT_ROOT}" ]; do
+  PROJECT_ROOT="${PROJECT_ROOT%/}"
+done
+[ "${PROJECT_ROOT}" = /tmp/aava-repo ]
+tracked_path=$'/tmp/aava-repo/dir\n/file'
+tracked_parent="${tracked_path%/*}"
+[ "${tracked_parent}" = $'/tmp/aava-repo/dir\n' ]
+iterations=0
+while [ "${tracked_parent}" != "${PROJECT_ROOT}" ]; do
+  tracked_parent="${tracked_parent%/*}"
+  iterations=$((iterations + 1))
+  [ "${iterations}" -lt 10 ]
+done
+'''
+
+    subprocess.run(["bash", "-c", script], check=True)
 
 
 def test_updater_makes_container_mount_parents_traversable_before_drop() -> None:

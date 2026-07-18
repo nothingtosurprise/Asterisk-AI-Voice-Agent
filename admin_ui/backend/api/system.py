@@ -4635,6 +4635,9 @@ def _update_plan_failure_detail(
         f"{output}\n\n"
         "Recovery (run these commands in a host SSH shell):\n"
         f"AAVA_REPO={quoted_root}\n"
+        'while [ "$AAVA_REPO" != "/" ] && [ "${AAVA_REPO%/}" != "$AAVA_REPO" ]; do\n'
+        '  AAVA_REPO="${AAVA_REPO%/}"\n'
+        'done\n'
         'AAVA_RECOVERY_PATCH="$(dirname "$AAVA_REPO")/aava-update-recovery.patch"\n'
         # RHEL/CentOS 7 ships Git 1.8.3, before `git -C`, `remote get-url`,
         # `--absolute-git-dir`, and `--path-format=absolute` existed.
@@ -4697,6 +4700,39 @@ def _update_plan_failure_detail(
         '"$AAVA_REPO/.agent" || { echo "Failed to repair .agent ownership; '
         'update not attempted" >&2; exit 2; }\n'
         "fi\n"
+        "(\n"
+        "  set -o pipefail\n"
+        '  aava_git ls-files -z | while IFS= read -r -d \'\' AAVA_TRACKED; do\n'
+        '    case "$AAVA_TRACKED" in\n'
+        '      ""|/*|../*|*/../*|*/..) echo "Refusing unsafe tracked path: '
+        '$AAVA_TRACKED" >&2; exit 2 ;;\n'
+        '    esac\n'
+        '    AAVA_TRACKED_PATH="$AAVA_REPO/$AAVA_TRACKED"\n'
+        '    AAVA_TRACKED_PARENT="${AAVA_TRACKED_PATH%/*}"\n'
+        '    while [ "$AAVA_TRACKED_PARENT" != "$AAVA_REPO" ]; do\n'
+        '      if sudo test -L "$AAVA_TRACKED_PARENT"; then\n'
+        '        printf \'Refusing symlinked tracked parent: %s '
+        '(restore the directory or inspect local changes before retrying)\\n\' '
+        '"$AAVA_TRACKED_PARENT" >&2\n'
+        '        exit 2\n'
+        '      fi\n'
+        '      AAVA_TRACKED_PARENT="${AAVA_TRACKED_PARENT%/*}"\n'
+        '    done\n'
+        '    AAVA_TRACKED_PARENT="${AAVA_TRACKED_PATH%/*}"\n'
+        '    while [ "$AAVA_TRACKED_PARENT" != "$AAVA_REPO" ]; do\n'
+        '      if sudo test -e "$AAVA_TRACKED_PARENT"; then\n'
+        '        printf \'%s\\0\' "$AAVA_TRACKED_PARENT"\n'
+        '      fi\n'
+        '      AAVA_TRACKED_PARENT="${AAVA_TRACKED_PARENT%/*}"\n'
+        '    done\n'
+        '    if sudo test -e "$AAVA_TRACKED_PATH" || '
+        'sudo test -L "$AAVA_TRACKED_PATH"; then\n'
+        '      printf \'%s\\0\' "$AAVA_TRACKED_PATH"\n'
+        '    fi\n'
+        '  done | sort -zu | sudo xargs -0 -r chown --no-dereference '
+        '"$AAVA_UID:$AAVA_GID" --\n'
+        ') || { echo "Failed to repair tracked checkout ownership; update not attempted" '
+        '>&2; exit 2; }\n'
         'AAVA_SETPRIV="$(command -v setpriv)" || { '
         'echo "setpriv is required; install util-linux and retry" >&2; exit 2; }\n'
         'AAVA_GROUPS="$(sudo -u "#$AAVA_UID" -g "#$AAVA_GID" id -G 2>/dev/null '
@@ -4752,8 +4788,8 @@ def _update_plan_failure_detail(
         f"--include-ui={include_ui_flag} --local-changes=retain --self-update=false\n"
         ")\n\n"
         "Use --local-changes=overwrite only after preserving any local source edits. "
-        "Only .git/.agent metadata is repaired, and temporary parent traversal is restored; "
-        "do not recursively chown the checkout."
+        "Only .git/.agent plus Git-tracked paths and their parents are repaired; untracked "
+        "files are untouched and temporary parent traversal is restored."
     )
 
 
