@@ -3,40 +3,46 @@ Outbound Campaign Dialer API endpoints (Milestone 22).
 
 MVP scope:
 - Campaign CRUD + status transitions (running/paused/stopped)
-- CSV lead import (skip_existing default)
+- CSV/XLSX lead import and manual lead entry (skip_existing default)
 - Leads list + ignore/recycle/delete
 - Attempts list + basic stats
 - Voicemail drop media upload + WAV preview (for browser playback)
 - Optional consent media upload + WAV preview (for browser playback)
 """
 
+import audioop
+import csv
 import io
+import json
 import logging
 import os
 import re
 import sys
 import uuid
 import wave
-import audioop
-from datetime import datetime, timezone
-from src.audio.resampler import resample_audio
-from typing import Any, Dict, List, Optional
+import zipfile
+from datetime import date, datetime, time as datetime_time, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from pathlib import Path
-import yaml
+
+# Add the project root before importing shared engine modules. The resolved
+# fallback keeps direct Admin-backend test runs working outside containers.
+project_root = os.environ.get("PROJECT_ROOT") or str(Path(__file__).resolve().parents[3])
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.audio.resampler import resample_audio
+from src.core.outbound_schedule import normalize_outbound_daily_window
+
 try:
     from zoneinfo import ZoneInfo, available_timezones
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
     available_timezones = None  # type: ignore
-
-# Add project root to path for imports (mirrors calls.py)
-project_root = os.environ.get("PROJECT_ROOT", "/app/project")
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +85,101 @@ def _vm_upload_max_bytes() -> int:
         return max(1, int(os.getenv("AAVA_VM_UPLOAD_MAX_BYTES", "12582912")))
     except Exception:
         return 12582912
+
+
+def _lead_import_max_bytes() -> int:
+    try:
+        return max(1, int(os.getenv("AAVA_OUTBOUND_LEAD_IMPORT_MAX_BYTES", "10485760")))
+    except Exception:
+        return 10485760
+
+
+def _lead_import_max_rows() -> int:
+    try:
+        return max(1, min(100_000, int(os.getenv("AAVA_OUTBOUND_LEAD_IMPORT_MAX_ROWS", "10000"))))
+    except Exception:
+        return 10000
+
+
+def _xlsx_cell_text(cell: Any) -> str:
+    value = cell.value
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, (date, datetime_time)):
+        return value.isoformat()
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        number_format = str(getattr(cell, "number_format", "") or "")
+        if re.fullmatch(r"0+", number_format):
+            return str(value).zfill(len(number_format))
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else format(value, ".15g")
+    return str(value)
+
+
+def _xlsx_to_csv_bytes(data: bytes) -> bytes:
+    """Convert the first XLSX worksheet into bounded UTF-8 CSV for one importer."""
+    if not data:
+        raise ValueError("Excel workbook is empty")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = archive.infolist()
+            if len(entries) > 1000:
+                raise ValueError("Excel workbook contains too many archive entries")
+            if sum(int(entry.file_size or 0) for entry in entries) > 50 * 1024 * 1024:
+                raise ValueError("Excel workbook expands beyond the 50 MB safety limit")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Invalid .xlsx workbook") from exc
+
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(
+            io.BytesIO(data),
+            read_only=True,
+            data_only=True,
+            keep_links=False,
+        )
+    except Exception as exc:
+        raise ValueError(f"Unable to read .xlsx workbook: {exc}") from exc
+
+    try:
+        if not workbook.worksheets:
+            raise ValueError("Excel workbook has no worksheets")
+        worksheet = workbook.worksheets[0]
+        max_rows = _lead_import_max_rows() + 1  # include header
+        max_columns = 64
+        if int(worksheet.max_row or 0) > max_rows:
+            raise ValueError(f"Excel worksheet exceeds the {max_rows - 1} lead row limit")
+        if int(worksheet.max_column or 0) > max_columns:
+            raise ValueError(f"Excel worksheet exceeds the {max_columns} column limit")
+
+        rows: List[List[str]] = []
+        for cells in worksheet.iter_rows(
+            min_row=1,
+            max_row=max_rows,
+            max_col=max_columns,
+        ):
+            row = [_xlsx_cell_text(cell) for cell in cells]
+            while row and row[-1] == "":
+                row.pop()
+            if row or rows:
+                rows.append(row)
+        while rows and not any(value.strip() for value in rows[-1]):
+            rows.pop()
+        if not rows or not any(value.strip() for value in rows[0]):
+            raise ValueError("Excel worksheet is missing a header row")
+
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerows(rows)
+        return output.getvalue().encode("utf-8")
+    finally:
+        workbook.close()
 
 
 DEFAULT_CONSENT_MEDIA_URI = "sound:ai-generated/aava-consent-default"
@@ -323,32 +424,103 @@ def _detect_server_timezone() -> str:
 
     return "UTC"
 
-def _load_known_context_names() -> List[str]:
-    """
-    Best-effort list of known context names from the active config.
-
-    Reads the merged config (base + local override) so operator-added
-    contexts in ai-agent.local.yaml are included.
-    """
+def _try_load_active_agents() -> Optional[List[Dict[str, Any]]]:
+    """Load active Agent metadata, preserving unavailable vs. valid-empty state."""
     try:
-        from api.config import _read_merged_config_dict
-        parsed = _read_merged_config_dict()
-    except Exception:
-        # Fallback to reading base file directly.
         try:
-            from settings import CONFIG_PATH
-            if not os.path.exists(CONFIG_PATH):
-                return []
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                parsed = yaml.safe_load(f) or {}
-        except Exception:
-            return []
-    if not isinstance(parsed, dict):
-        return []
-    ctxs = parsed.get("contexts") or {}
-    if not isinstance(ctxs, dict):
-        return []
-    return [str(k).strip() for k in ctxs.keys() if str(k).strip()]
+            from agents_store import AgentsStore
+        except ImportError:
+            from admin_ui.backend.agents_store import AgentsStore
+
+        with AgentsStore() as store:
+            rows = store.list_all()
+        return [
+            {
+                "slug": str(row.get("slug") or "").strip(),
+                "display_name": str(row.get("display_name") or "").strip(),
+                "is_default": bool(row.get("is_default")),
+            }
+            for row in rows
+            if bool(row.get("is_active")) and str(row.get("slug") or "").strip()
+        ]
+    except Exception:
+        logger.warning(
+            "Unable to load active Agents for outbound validation", exc_info=True
+        )
+        return None
+
+
+def _load_active_agents() -> List[Dict[str, Any]]:
+    """Best-effort active Agent metadata for API/UI responses."""
+    return _try_load_active_agents() or []
+
+
+def _load_known_agent_selectors() -> Tuple[Optional[List[str]], Optional[List[str]]]:
+    """Return canonical slugs and legacy display-name selectors for validation."""
+    agents = _try_load_active_agents()
+    if agents is None:
+        return None, None
+    slugs = [
+        str(agent.get("slug") or "").strip()
+        for agent in agents
+        if agent.get("slug")
+    ]
+    legacy_names = [
+        str(agent.get("display_name") or "").strip()
+        for agent in agents
+        if agent.get("display_name")
+    ]
+    # AI_CONTEXT resolution accepts display names first, then exact slugs.
+    return slugs, list(dict.fromkeys([*legacy_names, *slugs]))
+
+
+def _validate_campaign_schedule_for_start(campaign: Dict[str, Any]) -> None:
+    """Reject invalid campaign schedule data before it can enter running state."""
+    tz_name = str(campaign.get("timezone") or "").strip() or "UTC"
+    if ZoneInfo is not None:
+        try:
+            ZoneInfo(tz_name)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid timezone '{tz_name}'. Use an IANA timezone like 'America/Phoenix' or 'UTC'.",
+            ) from exc
+
+    start_local = normalize_outbound_daily_window(
+        campaign.get("daily_window_start_local"), "09:00"
+    )
+    end_local = normalize_outbound_daily_window(
+        campaign.get("daily_window_end_local"), "17:00"
+    )
+    if start_local is None or end_local is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Daily calling window must use a valid 24-hour H:MM or HH:MM value.",
+        )
+
+    parsed_absolute: Dict[str, datetime] = {}
+    for field_name, label in (
+        ("run_start_at_utc", "absolute run start"),
+        ("run_end_at_utc", "absolute run end"),
+    ):
+        raw_value = str(campaign.get(field_name) or "").strip()
+        if not raw_value:
+            continue
+        try:
+            value = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            parsed_absolute[field_name] = value.astimezone(timezone.utc)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {label} timestamp '{raw_value}'.",
+            ) from exc
+
+    run_start = parsed_absolute.get("run_start_at_utc")
+    run_end = parsed_absolute.get("run_end_at_utc")
+    if run_start and run_end and run_start > run_end:
+        raise HTTPException(status_code=400, detail="Absolute run start must be before or equal to run end.")
 
 @router.get("/meta")
 async def outbound_meta():
@@ -367,12 +539,16 @@ async def outbound_meta():
     return {
         "server_timezone": tz,
         "iana_timezones": tzs,
+        "agents": _load_active_agents(),
         "server_now_iso": datetime.now(timezone.utc).isoformat(),
         "default_amd_options": {
             "initial_silence_ms": 2000,
             "greeting_ms": 2000,
             "after_greeting_silence_ms": 1000,
             "total_analysis_time_ms": 5000,
+            "minimum_word_length_ms": 100,
+            "between_words_silence_ms": 50,
+            "maximum_number_of_words": 10,
         },
     }
 
@@ -416,6 +592,15 @@ class LeadImportResponse(BaseModel):
     warnings_truncated: bool = False
 
 
+class ManualLeadCreateRequest(BaseModel):
+    phone_number: str = Field(..., min_length=1, max_length=64)
+    name: Optional[str] = Field(None, max_length=200)
+    agent: Optional[str] = Field(None, max_length=64)
+    timezone: Optional[str] = Field(None, max_length=100)
+    caller_id: Optional[str] = Field(None, max_length=64)
+    custom_vars: Dict[str, Any] = Field(default_factory=dict)
+
+
 @router.get("/sample.csv")
 async def download_sample_csv():
     """
@@ -425,16 +610,22 @@ async def download_sample_csv():
       - name (optional)
       - phone_number (required)
         - Can be E.164 (+15551234567) or an internal extension (e.g., 2765)
-      - context (optional)
+      - agent (optional; active Agent slug used with AI_AGENT)
+      - context (deprecated compatibility alias for agent)
       - timezone (optional)
       - caller_id (optional)
       - custom_vars (optional JSON object)
     """
+    active_agents = _load_active_agents()
+    sample_agent = next(
+        (str(agent["slug"]) for agent in active_agents if agent.get("is_default")),
+        str(active_agents[0]["slug"]) if active_agents else "default",
+    )
     csv_text = (
-        "name,phone_number,context,timezone,caller_id,custom_vars\n"
-        "Extension Test,2765,demo_outbound,America/Phoenix,6789,\"{\"\"name\"\":\"\"Extension Test\"\",\"\"note\"\":\"\"Call internal extension\"\"}\"\n"
-        "Alice Example,+15557654321,demo_outbound,America/Phoenix,6789,\"{\"\"name\"\":\"\"Alice Example\"\",\"\"account_id\"\":\"\"A-1002\"\",\"\"note\"\":\"\"US lead example\"\"}\"\n"
-        "International Example,+447700900123,demo_outbound,America/Phoenix,6789,\"{\"\"name\"\":\"\"International Example\"\",\"\"account_id\"\":\"\"A-1003\"\",\"\"note\"\":\"\"International lead example\"\"}\"\n"
+        "name,phone_number,agent,timezone,caller_id,custom_vars\n"
+        f"Extension Test,2765,{sample_agent},America/Phoenix,6789,\"{{\"\"name\"\":\"\"Extension Test\"\",\"\"note\"\":\"\"Call internal extension\"\"}}\"\n"
+        f"Alice Example,+15557654321,{sample_agent},America/Phoenix,6789,\"{{\"\"name\"\":\"\"Alice Example\"\",\"\"account_id\"\":\"\"A-1002\"\",\"\"note\"\":\"\"US lead example\"\"}}\"\n"
+        f"International Example,+447700900123,{sample_agent},America/Phoenix,6789,\"{{\"\"name\"\":\"\"International Example\"\",\"\"account_id\"\":\"\"A-1003\"\",\"\"note\"\":\"\"International lead example\"\"}}\"\n"
     )
     return Response(
         content=csv_text,
@@ -550,15 +741,7 @@ async def set_campaign_status(campaign_id: str, req: CampaignStatusRequest):
                         status_code=400,
                         detail="Consent gate is enabled but no consent recording is set. Upload consent before starting.",
                     )
-            tz_name = (campaign.get("timezone") or "").strip() or "UTC"
-            if ZoneInfo is not None and tz_name.upper() != "UTC":
-                try:
-                    ZoneInfo(tz_name)
-                except Exception:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Invalid timezone '{tz_name}'. Use an IANA timezone like 'America/Phoenix' or 'UTC'.",
-                    )
+            _validate_campaign_schedule_for_start(campaign)
         return await store.set_campaign_status(campaign_id, req.status, cancel_pending=bool(req.cancel_pending))
     except KeyError:
         raise HTTPException(status_code=404, detail="Campaign not found")
@@ -581,14 +764,78 @@ async def import_leads(
 ):
     store = _get_outbound_store()
     try:
-        data = await file.read()
-        known_contexts = _load_known_context_names()
+        max_bytes = _lead_import_max_bytes()
+        data = await file.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Lead import is too large (max {max_bytes} bytes)",
+            )
+        filename = os.path.basename((file.filename or "").strip()).lower()
+        if filename.endswith(".xlsx"):
+            data = _xlsx_to_csv_bytes(data)
+        elif not filename.endswith(".csv"):
+            raise HTTPException(
+                status_code=400,
+                detail="Lead import must be a .csv or .xlsx file",
+            )
+        known_agents, known_contexts = _load_known_agent_selectors()
         result = await store.import_leads_csv(
             campaign_id,
             data,
             skip_existing=bool(skip_existing),
             max_error_rows=int(max_error_rows),
-            known_contexts=known_contexts or None,
+            known_agents=known_agents,
+            known_contexts=known_contexts,
+        )
+        return LeadImportResponse(**result)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/campaigns/{campaign_id}/leads",
+    response_model=LeadImportResponse,
+)
+async def add_manual_lead(campaign_id: str, req: ManualLeadCreateRequest):
+    """Add one lead through the same validation and duplicate path as file imports."""
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "name",
+            "phone_number",
+            "agent",
+            "timezone",
+            "caller_id",
+            "custom_vars",
+        ],
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "name": (req.name or "").strip(),
+            "phone_number": req.phone_number.strip(),
+            "agent": (req.agent or "").strip(),
+            "timezone": (req.timezone or "").strip(),
+            "caller_id": (req.caller_id or "").strip(),
+            "custom_vars": json.dumps(req.custom_vars or {}, separators=(",", ":")),
+        }
+    )
+
+    store = _get_outbound_store()
+    try:
+        known_agents, known_contexts = _load_known_agent_selectors()
+        result = await store.import_leads_csv(
+            campaign_id,
+            output.getvalue().encode("utf-8"),
+            skip_existing=True,
+            max_error_rows=20,
+            known_agents=known_agents,
+            known_contexts=known_contexts,
         )
         return LeadImportResponse(**result)
     except KeyError:
