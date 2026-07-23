@@ -2,6 +2,7 @@ import React from 'react';
 import { Info, Mic } from 'lucide-react';
 import ProviderCredentialsCard, { applyCredentialPatch } from './ProviderCredentialsCard';
 import HelpTooltip from '../../ui/HelpTooltip';
+import OutputResamplerField from './OutputResamplerField';
 
 interface ElevenLabsProviderFormProps {
     config: any;
@@ -374,6 +375,14 @@ const ElevenLabsProviderForm: React.FC<ElevenLabsProviderFormProps> = ({ config,
                     <p className="text-xs text-muted-foreground">
                         TTS output sample rate. 16000 Hz or 22050 Hz typical.
                     </p>
+                </div>
+                <div className="md:col-span-2">
+                    <OutputResamplerField
+                        value={config.output_resampler}
+                        sourceRate={config.output_sample_rate_hz || 16000}
+                        targetRate={config.target_sample_rate_hz || 8000}
+                        onChange={(value) => handleChange('output_resampler', value)}
+                    />
                 </div>
             </div>
 

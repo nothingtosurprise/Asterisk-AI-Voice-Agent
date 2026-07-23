@@ -23,7 +23,11 @@ from urllib.parse import urlparse
 import aiohttp
 import websockets
 
-from ..audio import convert_pcm16le_to_target_format, resample_audio
+from ..audio import (
+    convert_pcm16le_to_target_format,
+    resample_audio,
+    resolve_output_resampler_policy,
+)
 from ..config import AppConfig, OpenAIProviderConfig
 from ..logging_config import get_logger
 from .base import LLMComponent, STTComponent, TTSComponent, LLMResponse
@@ -1076,6 +1080,7 @@ class OpenAITTSAdapter(TTSComponent):
             source_rate,
             merged["target_format"]["encoding"],
             merged["target_format"]["sample_rate"],
+            merged["output_resampler"],
         )
 
         logger.info(
@@ -1151,7 +1156,16 @@ class OpenAITTSAdapter(TTSComponent):
             ),
             "source_format": merged_source,
             "target_format": merged_target,
+            "output_resampler": runtime_options.get(
+                "output_resampler",
+                self._pipeline_defaults.get(
+                    "output_resampler", self._provider_defaults.output_resampler
+                ),
+            ),
         }
+        merged["output_resampler"] = resolve_output_resampler_policy(
+            provider_mode=merged.get("output_resampler")
+        )[0]
         return merged
 
     @staticmethod
@@ -1204,11 +1218,17 @@ class OpenAITTSAdapter(TTSComponent):
         source_rate: int,
         target_encoding: str,
         target_rate: int,
+        output_resampler: str = "linear",
     ) -> bytes:
         if not pcm_bytes:
             return b""
         if int(source_rate) != int(target_rate):
-            pcm_bytes, _ = resample_audio(pcm_bytes, int(source_rate), int(target_rate))
+            pcm_bytes, _ = resample_audio(
+                pcm_bytes,
+                int(source_rate),
+                int(target_rate),
+                mode=output_resampler,
+            )
         return convert_pcm16le_to_target_format(pcm_bytes, target_encoding)
 
 

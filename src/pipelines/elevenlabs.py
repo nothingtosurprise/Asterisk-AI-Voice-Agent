@@ -7,8 +7,11 @@ API Reference: https://elevenlabs.io/docs/api-reference/text-to-speech
 """
 from __future__ import annotations
 
-import audioop
-from ..audio.resampler import resample_audio
+from ..audio.resampler import (
+    pcm16le_to_mulaw,
+    resample_audio,
+    resolve_output_resampler_policy,
+)
 import time
 import uuid
 from typing import Any, AsyncIterator, Callable, Dict, Optional
@@ -171,12 +174,16 @@ class ElevenLabsTTSAdapter(TTSComponent):
                     converted = raw_audio
                 elif output_format == "pcm_16000":
                     # Convert PCM16 16kHz to μ-law 8kHz
-                    resampled, _ = resample_audio(raw_audio, 16000, 8000)
-                    converted = audioop.lin2ulaw(resampled, 2)
+                    resampled, _ = resample_audio(
+                        raw_audio, 16000, 8000, mode=merged["output_resampler"]
+                    )
+                    converted = pcm16le_to_mulaw(resampled)
                 elif output_format == "pcm_24000":
                     # Convert PCM16 24kHz to μ-law 8kHz
-                    resampled, _ = resample_audio(raw_audio, 24000, 8000)
-                    converted = audioop.lin2ulaw(resampled, 2)
+                    resampled, _ = resample_audio(
+                        raw_audio, 24000, 8000, mode=merged["output_resampler"]
+                    )
+                    converted = pcm16le_to_mulaw(resampled)
                 else:
                     # For other formats, assume it's already usable or skip conversion
                     logger.warning(
@@ -242,8 +249,16 @@ class ElevenLabsTTSAdapter(TTSComponent):
                 self._pipeline_defaults.get("use_speaker_boost", self._provider_config.use_speaker_boost)),
             "chunk_size_ms": runtime_options.get("chunk_size_ms",
                 self._pipeline_defaults.get("chunk_size_ms", 20)),
+            "output_resampler": runtime_options.get(
+                "output_resampler",
+                self._pipeline_defaults.get(
+                    "output_resampler", self._provider_config.output_resampler
+                ),
+            ),
         }
-        
+        merged["output_resampler"] = resolve_output_resampler_policy(
+            provider_mode=merged.get("output_resampler")
+        )[0]
         return merged
 
     def _chunk_audio(self, audio: bytes, chunk_ms: int = 20) -> list:

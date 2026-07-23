@@ -1,6 +1,7 @@
 import React from 'react';
 import ProviderCredentialsCard, { applyCredentialPatch } from './ProviderCredentialsCard';
 import HelpTooltip from '../../ui/HelpTooltip';
+import OutputResamplerField from './OutputResamplerField';
 
 // Current GA Realtime model catalog. Verified against OpenAI's official model
 // pages on 2026-05-25:
@@ -690,6 +691,14 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
                             className="w-full p-2 rounded border border-input bg-background"
                             value={config.target_sample_rate_hz || 8000}
                             onChange={(e) => handleChange('target_sample_rate_hz', parseInt(e.target.value))}
+                        />
+                    </div>
+                    <div className="md:col-span-2">
+                        <OutputResamplerField
+                            value={config.output_resampler}
+                            sourceRate={config.output_sample_rate_hz || 24000}
+                            targetRate={config.target_sample_rate_hz || 8000}
+                            onChange={(value) => handleChange('output_resampler', value)}
                         />
                     </div>
                     <div className="space-y-2">

@@ -220,4 +220,3 @@ async def test_start_streaming_playback_normalizes_externalmedia_ulaw(monkeypatc
     info = mgr.active_streams[call_id]
     assert info.get("target_format") == "ulaw"
     assert info.get("target_sample_rate") == 8000
-

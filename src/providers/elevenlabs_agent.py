@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import audioop
-from ..audio.resampler import resample_audio
+from ..audio.resampler import resample_audio, resolve_output_resampler_policy
 import struct
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -102,6 +102,24 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         # Audio resampling state
         self._resample_state_in = None  # For input resampling
         self._resample_state_out = None  # For output resampling
+        self._output_resampler_environment_variable = "AAVA_ELEVENLABS_OUTPUT_RESAMPLER"
+        configured_output_resampler, output_resampler_source = (
+            resolve_output_resampler_policy(
+                profile_mode="linear",
+                provider_mode=getattr(config, "output_resampler", "inherit"),
+                environment_mode=os.getenv(
+                    self._output_resampler_environment_variable
+                ),
+            )
+        )
+        if output_resampler_source.endswith("invalid-fallback"):
+            logger.warning(
+                "Invalid ElevenLabs output resampler source %r; using compatibility default",
+                output_resampler_source,
+            )
+        self._output_resampler_mode = configured_output_resampler
+        self._output_resampler_source = output_resampler_source
+        self._output_resampler_logged = False
         
         # Turn latency tracking (Milestone 21 - Call History)
         self._turn_start_time: Optional[float] = None
@@ -170,6 +188,7 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         self._keepalive_task = None
         self._resample_state_in = None
         self._resample_state_out = None
+        self._output_resampler_logged = False
         
         if on_event:
             self.on_event = on_event
@@ -652,8 +671,29 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         # Resample if needed
         if source_rate != target_rate:
             output, self._resample_state_out = resample_audio(
-                output, source_rate, target_rate, state=self._resample_state_out
+                output,
+                source_rate,
+                target_rate,
+                state=self._resample_state_out,
+                mode=self._output_resampler_mode,
             )
+            if not self._output_resampler_logged:
+                alias_safe = bool(
+                    self._output_resampler_mode == "bandlimited"
+                    and source_rate > target_rate
+                    and source_rate % target_rate == 0
+                )
+                logger.info(
+                    "[elevenlabs] [%s] Output resampler selected: configured=%s "
+                    "active=%s source_rate=%s target_rate=%s alias_safe=%s",
+                    self._call_id,
+                    self._output_resampler_mode,
+                    "bandlimited" if alias_safe else "linear",
+                    source_rate,
+                    target_rate,
+                    alias_safe,
+                )
+                self._output_resampler_logged = True
         
         # Encode to μ-law or a-law if needed
         if target_encoding in ("ulaw", "mulaw"):
@@ -726,6 +766,8 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             "reason": reason,
             "provider_event_id": event_id,
         })
+        self._resample_state_out = None
+        self._output_resampler_logged = False
     
     async def _handle_user_transcript(self, data: Dict[str, Any]) -> None:
         """Handle user transcript (STT result)."""

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import ProviderCredentialsCard, { applyCredentialPatch } from './ProviderCredentialsCard';
 import HelpTooltip from '../../ui/HelpTooltip';
+import OutputResamplerField from './OutputResamplerField';
 
 interface DeepgramProviderFormProps {
     config: any;
@@ -636,6 +637,14 @@ const DeepgramProviderForm: React.FC<DeepgramProviderFormProps> = ({ config, onC
                         <p className="text-xs text-muted-foreground">
                             Final sample rate for playback. 8000 Hz for standard telephony.
                         </p>
+                    </div>
+                    <div className="md:col-span-2">
+                        <OutputResamplerField
+                            value={config.output_resampler}
+                            sourceRate={config.output_sample_rate_hz || 8000}
+                            targetRate={config.target_sample_rate_hz || 8000}
+                            onChange={(value) => handleChange('output_resampler', value)}
+                        />
                     </div>
 
                     <div className="space-y-2">

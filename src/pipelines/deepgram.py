@@ -20,7 +20,12 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import aiohttp
 import websockets
 
-from ..audio import convert_pcm16le_to_target_format, mulaw_to_pcm16le, resample_audio
+from ..audio import (
+    convert_pcm16le_to_target_format,
+    mulaw_to_pcm16le,
+    resample_audio,
+    resolve_output_resampler_policy,
+)
 from ..config import AppConfig, DeepgramProviderConfig
 from ..logging_config import get_logger
 from .base import STREAMING_STT_FORMAT_ALIASES, STTComponent, TTSComponent
@@ -694,7 +699,14 @@ class DeepgramTTSAdapter(TTSComponent):
             raw_audio = await response.read()
             source_encoding = params.get("encoding", "linear16")
             source_sample_rate = int(params.get("sample_rate", target_sample_rate))
-            converted = self._convert_audio(raw_audio, source_encoding, source_sample_rate, target_encoding, target_sample_rate)
+            converted = self._convert_audio(
+                raw_audio,
+                source_encoding,
+                source_sample_rate,
+                target_encoding,
+                target_sample_rate,
+                merged["output_resampler"],
+            )
             latency_ms = (time.perf_counter() - started_at) * 1000.0
 
         logger.info(
@@ -734,6 +746,12 @@ class DeepgramTTSAdapter(TTSComponent):
             "chunk_size_ms": runtime_options.get("chunk_size_ms", self._pipeline_defaults.get("chunk_size_ms", 20)),
             "api_key": runtime_options.get("api_key", self._pipeline_defaults.get("api_key", self._provider_defaults.api_key)),
             "format": merged_format,
+            "output_resampler": runtime_options.get(
+                "output_resampler",
+                self._pipeline_defaults.get(
+                    "output_resampler", self._provider_defaults.output_resampler
+                ),
+            ),
         }
         # Default the provider output (source_format) sample rate to the target sample rate
         # so we request 8 kHz from Deepgram when our downstream is μ-law 8 kHz.
@@ -743,6 +761,9 @@ class DeepgramTTSAdapter(TTSComponent):
             "encoding": source_cfg.get("encoding", "linear16"),
             "sample_rate": int(source_cfg.get("sample_rate", default_source_rate)),
         }
+        merged["output_resampler"] = resolve_output_resampler_policy(
+            provider_mode=merged.get("output_resampler")
+        )[0]
         return merged
 
     def _build_tts_request(
@@ -774,6 +795,7 @@ class DeepgramTTSAdapter(TTSComponent):
         source_rate: int,
         target_encoding: str,
         target_rate: int,
+        output_resampler: str = "linear",
     ) -> bytes:
         if not audio_bytes:
             return b""
@@ -785,7 +807,12 @@ class DeepgramTTSAdapter(TTSComponent):
             pcm_bytes = audio_bytes
 
         if source_rate != target_rate:
-            pcm_bytes, _ = resample_audio(pcm_bytes, source_rate, target_rate)
+            pcm_bytes, _ = resample_audio(
+                pcm_bytes,
+                source_rate,
+                target_rate,
+                mode=output_resampler,
+            )
 
         return convert_pcm16le_to_target_format(pcm_bytes, target_encoding)
 

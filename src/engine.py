@@ -56,7 +56,7 @@ from .logging_config import get_logger, configure_logging
 from .live_status_publisher import LiveStatusPublisher, live_status_component
 from .rtp_server import RTPServer
 from .audio.audiosocket_server import AudioSocketServer
-from .audio.resampler import resample_audio
+from .audio.resampler import resample_audio, resolve_output_resampler_policy
 from .providers.base import AIProviderInterface
 from .providers.deepgram import DeepgramProvider
 from .providers.local import LocalProvider
@@ -113,6 +113,27 @@ OUTBOUND_AMD_HUMAN_FIRST_DEFAULTS: Dict[str, int] = {
     "between_words_silence_ms": 50,
     "maximum_number_of_words": 10,
 }
+
+
+def _resolve_pipeline_streaming_overlap(
+    streaming_config: Any,
+    tts_options: Any,
+) -> Tuple[bool, str]:
+    """Resolve the pipeline TTS overlap policy and report its source.
+
+    The pipeline override is deliberately optional so existing configurations
+    retain the global behavior. AppConfig rejects non-boolean overrides at
+    load/apply time; the exact-type check here keeps direct test/runtime callers
+    fail-closed if they bypass config validation.
+    """
+    global_enabled = bool(
+        getattr(streaming_config, "pipeline_streaming_overlap", False)
+        if streaming_config
+        else False
+    )
+    if isinstance(tts_options, dict) and type(tts_options.get("streaming_overlap")) is bool:
+        return tts_options["streaming_overlap"], "pipeline"
+    return global_enabled, "global"
 
 
 def _outbound_attempt_stale_seconds() -> float:
@@ -3345,6 +3366,20 @@ class Engine:
             return True
         provider_kind = self._get_provider_kind(provider_name) or provider_name
         return provider_name in allow or provider_kind in allow
+
+    def _provider_fallback_min_ms(self, cfg, provider_name: str) -> int:
+        """Resolve a scoped fallback threshold without changing global VAD timing."""
+        default_ms = int(getattr(cfg, "min_ms", 250) or 250)
+        overrides = getattr(cfg, "provider_fallback_min_ms_by_provider", None) or {}
+        if not isinstance(overrides, dict):
+            return max(1, default_ms)
+        provider_kind = self._get_provider_kind(provider_name) or provider_name
+        has_override = provider_name in overrides or provider_kind in overrides
+        raw_value = overrides.get(provider_name, overrides.get(provider_kind, default_ms))
+        try:
+            return max(40 if has_override else 1, int(raw_value))
+        except (TypeError, ValueError):
+            return max(1, default_ms)
 
     def _assign_session_provider(self, session: CallSession, provider_name: str) -> None:
         session.provider_name = provider_name
@@ -8443,6 +8478,12 @@ class Engine:
                     logger.debug("Cleanup already in progress (in-memory guard)", call_id=call_id)
                     return
                 _cleanup_in_progress.add(call_id)
+                # Fail closed before the first cleanup await. Pipeline/provider
+                # operations retain this CallSession object and may finish an
+                # in-flight network request even after task cancellation. The
+                # session marker gives every late output boundary a durable
+                # signal that no new caller-facing work may start.
+                session.cleanup_in_progress = True
                 # Set TTL guard IMMEDIATELY to block late events (AAVA-148 fix)
                 import time as _time
                 _cleanup_completed_at[call_id] = _time.time()
@@ -8508,6 +8549,40 @@ class Engine:
                         call_id=call_id,
                         exc_info=True,
                     )
+
+            # Stop the dialog producer before tearing down playback or media.
+            # An in-flight LLM request can otherwise finish after the first
+            # stop_streaming_playback() call and create a new stream on a dead
+            # AudioSocket/bridge.  Cancel and await the runner first, then stop
+            # any stream it had already created.
+            try:
+                task = self._pipeline_tasks.pop(call_id, None)
+                if task:
+                    task.cancel()
+                    with contextlib.suppress(
+                        asyncio.CancelledError,
+                        asyncio.TimeoutError,
+                        Exception,
+                    ):
+                        await asyncio.wait_for(task, timeout=2.0)
+                q = self._pipeline_queues.pop(call_id, None)
+                if q:
+                    try:
+                        q.put_nowait(None)
+                    except Exception:
+                        pass
+                self._pipeline_transcript_queues.pop(call_id, None)
+                try:
+                    await self._disable_pipeline_talk_detect(session)
+                except Exception:
+                    logger.debug(
+                        "Pipeline talk detect disable failed",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
+                self._pipeline_forced.pop(call_id, None)
+            except Exception:
+                logger.debug("Pipeline cleanup failed", call_id=call_id, exc_info=True)
 
             # Stop any active streaming playback.
             try:
@@ -8699,28 +8774,6 @@ class Engine:
                 self.audiosocket_channels.pop(session.caller_channel_id, None)
             if session.audiosocket_uuid:
                 self.uuidext_to_channel.pop(session.audiosocket_uuid, None)
-
-            # Cancel adapter pipeline runner, clear queue and forced flag
-            try:
-                task = self._pipeline_tasks.pop(call_id, None)
-                if task:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                        await asyncio.wait_for(task, timeout=2.0)
-                q = self._pipeline_queues.pop(call_id, None)
-                if q:
-                    try:
-                        q.put_nowait(None)
-                    except Exception:
-                        pass
-                self._pipeline_transcript_queues.pop(call_id, None)
-                try:
-                    await self._disable_pipeline_talk_detect(session)
-                except Exception:
-                    logger.debug("Pipeline talk detect disable failed", call_id=call_id, exc_info=True)
-                self._pipeline_forced.pop(call_id, None)
-            except Exception:
-                logger.debug("Pipeline cleanup failed", call_id=call_id, exc_info=True)
 
             # Clear per-call resample states to prevent unbounded memory growth
             self._resample_state_provider_in.pop(call_id, None)
@@ -10697,7 +10750,7 @@ class Engine:
             last_barge_in_ts = float(getattr(session, "last_barge_in_ts", 0.0) or 0.0)
             in_cooldown = (now - last_barge_in_ts) * 1000 < cooldown_ms if last_barge_in_ts else False
 
-            min_ms = int(getattr(cfg, "min_ms", 250))
+            min_ms = self._provider_fallback_min_ms(cfg, provider_name)
             if local_energy_authoritative:
                 # Local full-agent speech consists of short telephony syllable
                 # bursts separated by natural sub-threshold gaps.  Reuse the
@@ -10825,6 +10878,24 @@ class Engine:
 
         first_barge_min = int(getattr(cfg, "local_first_barge_min_ms", 80) or 80)
         return max(40, min(base_min, first_barge_min))
+
+    @staticmethod
+    def _resolve_provider_output_suppress_ms(
+        cfg,
+        *,
+        source: str,
+        provider_kind: str,
+    ) -> int:
+        """Suppress only when local detection may race continuing provider audio.
+
+        An explicit provider interruption event is the authoritative boundary
+        for the old response. Suppressing after that boundary can mute the
+        provider's next response, including a short terminal farewell.
+        """
+        suppress_ms = int(getattr(cfg, "provider_output_suppress_ms", 0)) if cfg else 0
+        if source == "provider_event" or provider_kind == "grok":
+            return 0
+        return max(0, suppress_ms)
 
     async def _apply_barge_in_action(self, call_id: str, *, source: str, reason: str) -> None:
         """Apply platform-owned barge-in actions (flush local output only).
@@ -10958,14 +11029,13 @@ class Engine:
                 # by continued provider streaming of the previous sentence.
                 try:
                     cfg = getattr(self.config, "barge_in", None)
-                    suppress_ms = int(getattr(cfg, "provider_output_suppress_ms", 0)) if cfg else 0
                     provider = (getattr(self, "_call_providers", {}) or {}).get(call_id)
                     provider_kind = str(getattr(provider, "provider_kind", "") or "").lower()
-                    # Grok server_vad automatically interrupts the old response.
-                    # Suppressing unlabelled AgentAudio here drops the beginning of
-                    # the *new* response when xAI generates it inside this window.
-                    if provider_kind == "grok":
-                        suppress_ms = 0
+                    suppress_ms = self._resolve_provider_output_suppress_ms(
+                        cfg,
+                        source=source,
+                        provider_kind=provider_kind,
+                    )
                     if suppress_ms > 0:
                         sup = session.vad_state.setdefault("output_suppression", {})
                         prev_until = float(sup.get("until_ts", 0.0) or 0.0)
@@ -12300,32 +12370,33 @@ class Engine:
                     )
                 except Exception:
                     pass
-                # Use streaming config rate for provider audio, not transport_profile which can be
-                # corrupted by inbound audio detection (user's 8kHz vs provider's 16kHz)
-                wire_rate = getattr(self.config.streaming, "sample_rate", 16000) or rate or 16000
                 try:
-                    transport_encoding = self._canonicalize_encoding(session.transport_profile.format)
+                    # New TransportProfile instances are immutable per call, so use
+                    # their wire rate instead of the process-wide streaming default.
+                    wire_rate = int(session.transport_profile.wire_sample_rate)
                 except Exception:
-                    transport_encoding = ""
+                    wire_rate = int(
+                        getattr(self.config.streaming, "sample_rate", 16000)
+                        or rate
+                        or 16000
+                    )
                 out_chunk = chunk
+                playback_rate = rate
                 if enc in ("linear16", "pcm16", "slin", "slin16") and rate and wire_rate and rate != wire_rate:
                     try:
-                        prov_out_state = self._resample_state_provider_out.get(call_id)
-                        out_chunk, prov_out_state = resample_audio(chunk, rate, wire_rate, state=prov_out_state)
-                        self._resample_state_provider_out[call_id] = prov_out_state
-                        seq = self._provider_chunk_seq.get(call_id, 0) + 1
-                        self._provider_chunk_seq[call_id] = seq
-                        logger.info(
-                            "PROVIDER CHUNK",
+                        out_chunk, playback_rate = self._resample_full_agent_output(
                             call_id=call_id,
-                            seq=seq,
-                            size_bytes=len(chunk),
+                            session=session,
+                            chunk=chunk,
                             encoding=enc,
-                            sample_rate_hz=rate,
-                            approx_duration_ms=duration_ms,
+                            source_rate=rate,
+                            target_rate=wire_rate,
                         )
                     except Exception:
                         logger.debug("Provider chunk resample failed; passing original", call_id=call_id, exc_info=True)
+                fmt_entry["playback_encoding"] = enc
+                fmt_entry["playback_sample_rate"] = playback_rate
+                self._provider_stream_formats[call_id] = fmt_entry
                 # Do not slice μ-law in engine; StreamingPlaybackManager handles segmentation/pacing
 
                 # Guardrail: downstream_mode=file is not compatible with streaming/chunked AgentAudio.
@@ -12448,7 +12519,10 @@ class Engine:
                             session.audio_diagnostics["codec_remediation"] = remediation
                         
                         # Get source sample rate with fallback to provider's configured output rate
-                        source_sample_rate = fmt_info.get("sample_rate")
+                        source_sample_rate = (
+                            fmt_info.get("playback_sample_rate")
+                            or fmt_info.get("sample_rate")
+                        )
                         if not source_sample_rate:
                             # Fallback: use provider's configured output rate (prevents 8kHz default)
                             try:
@@ -12477,7 +12551,10 @@ class Engine:
                                 call_id,
                                 q,
                                 playback_type=playback_type,
-                                source_encoding=fmt_info.get("encoding"),
+                                source_encoding=(
+                                    fmt_info.get("playback_encoding")
+                                    or fmt_info.get("encoding")
+                                ),
                                 source_sample_rate=source_sample_rate,
                                 target_encoding=target_encoding,
                                 target_sample_rate=target_sample_rate,
@@ -12537,10 +12614,21 @@ class Engine:
                                 target_sample_rate = session.transport_profile.wire_sample_rate
                             if remediation:
                                 session.audio_diagnostics["codec_remediation"] = remediation
-                            src_encoding = fmt_info.get("encoding") or encoding
+                            src_encoding = (
+                                fmt_info.get("playback_encoding")
+                                or fmt_info.get("encoding")
+                                or encoding
+                            )
                             provider_obj = getattr(self, "_call_providers", {}).get(call_id) if provider_name else None
-                            src_rate = fmt_info.get("sample_rate") or sample_rate_int or (
-                                getattr(provider_obj, "_dg_output_rate", None) if provider_obj else None
+                            src_rate = (
+                                fmt_info.get("playback_sample_rate")
+                                or fmt_info.get("sample_rate")
+                                or sample_rate_int
+                                or (
+                                    getattr(provider_obj, "_dg_output_rate", None)
+                                    if provider_obj
+                                    else None
+                                )
                             )
                             
                             # DOWNSTREAM_MODE GATING: Check if streaming playback is allowed
@@ -12791,8 +12879,14 @@ class Engine:
                                 call_id,
                                 q2,
                                 playback_type=playback_type,
-                                source_encoding=fmt_info.get("encoding"),
-                                source_sample_rate=fmt_info.get("sample_rate"),
+                                source_encoding=(
+                                    fmt_info.get("playback_encoding")
+                                    or fmt_info.get("encoding")
+                                ),
+                                source_sample_rate=(
+                                    fmt_info.get("playback_sample_rate")
+                                    or fmt_info.get("sample_rate")
+                                ),
                                 target_encoding=target_encoding,
                                 target_sample_rate=target_sample_rate,
                             )
@@ -13710,6 +13804,14 @@ class Engine:
     async def _ensure_pipeline_runner(self, session: CallSession, *, forced: bool = False) -> None:
         """Create per-call queue and start pipeline runner if not already started."""
         call_id = session.call_id
+        if call_id in _cleanup_in_progress or bool(
+            getattr(session, "cleanup_in_progress", False)
+        ):
+            logger.info(
+                "Pipeline runner start suppressed after cleanup began",
+                call_id=call_id,
+            )
+            return
         if call_id in self._pipeline_tasks:
             if forced:
                 self._pipeline_forced[call_id] = True
@@ -13736,6 +13838,33 @@ class Engine:
         self._pipeline_tasks[call_id] = task
         logger.info("Pipeline runner started", call_id=call_id, pipeline=session.pipeline_name)
 
+    def _pipeline_output_allowed(
+        self,
+        call_id: str,
+        session: Optional[CallSession],
+        *,
+        stage: str,
+    ) -> bool:
+        """Fail closed when a pipeline tries to create output during cleanup.
+
+        Cancellation is advisory for network-backed adapters: a request can
+        finish after its owning task is cancelled. Check both the engine's
+        atomic cleanup guard and the session marker at the actual output
+        boundary so a late result cannot create playback, TTS, or tool work.
+        """
+        allowed = bool(
+            session
+            and call_id not in _cleanup_in_progress
+            and not bool(getattr(session, "cleanup_in_progress", False))
+        )
+        if not allowed:
+            logger.info(
+                "Pipeline output suppressed after cleanup began",
+                call_id=call_id,
+                stage=stage,
+            )
+        return allowed
+
     async def _pipeline_runner(self, call_id: str) -> None:
         """Minimal adapter-driven loop: STT -> LLM -> TTS -> file playback.
 
@@ -13744,7 +13873,9 @@ class Engine:
         """
         try:
             session = await self.session_store.get_by_call_id(call_id)
-            if not session:
+            if not self._pipeline_output_allowed(
+                call_id, session, stage="runner-initialization"
+            ):
                 return
             pipeline = self.pipeline_orchestrator.get_pipeline(call_id, getattr(session, 'pipeline_name', None))
             if not pipeline:
@@ -14023,7 +14154,14 @@ class Engine:
             
             # Final pass: ensure greeting can safely reference template variables.
             if greeting:
-                greeting = self._apply_prompt_template_substitution(greeting, session)
+                if not self._pipeline_output_allowed(
+                    call_id, session, stage="greeting-start"
+                ):
+                    greeting = ""
+                else:
+                    greeting = self._apply_prompt_template_substitution(
+                        greeting, session
+                    )
 
             # Bound pipeline greeting handoff just like monolithic providers.
             # This background watchdog still fires if a TTS async generator hangs
@@ -14382,6 +14520,10 @@ class Engine:
 
                 async def run_turn(transcript_text: str) -> None:
                     nonlocal conversation_history
+                    if not self._pipeline_output_allowed(
+                        call_id, session, stage="turn-start"
+                    ):
+                        return
                     response_text = ""
                     tool_calls = []
                     _streaming_handled = False  # Set True when streaming overlap played audio + recorded history
@@ -14465,7 +14607,10 @@ class Engine:
                     # call instead of text, generate_stream() yields nothing and we
                     # fall through to the serial path for tool execution.
                     _streaming_cfg = getattr(self.config, "streaming", None)
-                    _overlap_enabled = getattr(_streaming_cfg, "pipeline_streaming_overlap", False) if _streaming_cfg else False
+                    _overlap_enabled, _overlap_source = _resolve_pipeline_streaming_overlap(
+                        _streaming_cfg,
+                        pipeline.tts_options,
+                    )
                     _adapter_supports_streaming = getattr(pipeline.llm_adapter, "supports_streaming", False)
 
                     _tts_dm_override = getattr(pipeline.tts_adapter, "downstream_mode_override", "auto") or "auto"
@@ -14476,6 +14621,16 @@ class Engine:
                     else:
                         _use_streaming_pb = self.config.downstream_mode != "file"
 
+                    logger.info(
+                        "Pipeline streaming overlap policy resolved",
+                        call_id=call_id,
+                        pipeline=pipeline_label,
+                        enabled=_overlap_enabled,
+                        source=_overlap_source,
+                        adapter_supports_streaming=_adapter_supports_streaming,
+                        streaming_playback=_use_streaming_pb,
+                    )
+
                     if (
                         _overlap_enabled
                         and _adapter_supports_streaming
@@ -14485,6 +14640,7 @@ class Engine:
                             "Pipeline streaming overlap active",
                             call_id=call_id,
                             pipeline=pipeline_label,
+                            policy_source=_overlap_source,
                             tools_configured=bool((llm_options or {}).get("tools")),
                         )
                         _SENTENCE_RE = re.compile(r"[.!?]\s+")
@@ -14685,6 +14841,11 @@ class Engine:
                             logger.debug("LLM generate failed", call_id=call_id, exc_info=True)
                             return
 
+                        if not self._pipeline_output_allowed(
+                            call_id, session, stage="post-llm"
+                        ):
+                            return
+
                         # Handle structured LLM response with tool calls
                         if isinstance(llm_result, LLMResponse):
                             response_text = (llm_result.text or "").strip()
@@ -14802,6 +14963,10 @@ class Engine:
                                     context_for_llm,
                                     llm_options_no_tools,
                                 )
+                                if not self._pipeline_output_allowed(
+                                    call_id, session, stage="post-llm-retry"
+                                ):
+                                    return
                                 if isinstance(llm_result_retry, LLMResponse):
                                     response_text = (llm_result_retry.text or "").strip()
                                     tool_calls = llm_result_retry.tool_calls or []
@@ -14823,6 +14988,11 @@ class Engine:
                                 )
 
                     if not response_text and not tool_calls:
+                        return
+
+                    if not self._pipeline_output_allowed(
+                        call_id, session, stage="pre-output"
+                    ):
                         return
 
                     # Update conversation history (skip if streaming path already did this)
@@ -17220,6 +17390,39 @@ class Engine:
 
         return transport_fmt, transport_rate, remediation
 
+    def _apply_pipeline_output_resampler_policy(
+        self,
+        session: CallSession,
+        resolution: PipelineResolution,
+    ) -> None:
+        """Bind profile-driven output policy to a per-call pipeline."""
+        if resolution.tts_options.get("_output_resampler_resolved"):
+            return
+        transport = getattr(session, "transport_profile", None)
+        profile_mode = getattr(transport, "output_resampler", "linear")
+        pipeline_mode = resolution.tts_options.get("output_resampler", "inherit")
+        adapter = resolution.tts_adapter
+        provider_config = getattr(adapter, "_provider_defaults", None)
+        if provider_config is None:
+            provider_config = getattr(adapter, "_provider_config", None)
+        provider_mode = getattr(provider_config, "output_resampler", "inherit")
+        mode, source = resolve_output_resampler_policy(
+            profile_mode=profile_mode,
+            provider_mode=provider_mode,
+            pipeline_mode=pipeline_mode,
+        )
+        resolution.tts_options["output_resampler"] = mode
+        resolution.tts_options["output_resampler_source"] = source
+        resolution.tts_options["_output_resampler_resolved"] = True
+        logger.info(
+            "Pipeline output resampler policy resolved",
+            call_id=session.call_id,
+            pipeline=resolution.pipeline_name,
+            profile=getattr(transport, "profile_name", None),
+            mode=mode,
+            source=source,
+        )
+
     async def _assign_pipeline_to_session(
         self,
         session: CallSession,
@@ -17283,6 +17486,8 @@ class Engine:
                     session, pipeline_name, "pipeline resolution returned no result"
                 )
             return None
+
+        self._apply_pipeline_output_resampler_policy(session, resolution)
  
         component_summary = resolution.component_summary()
         updated = False
@@ -17453,12 +17658,115 @@ class Engine:
         except Exception:
             logger.debug("Failed applying provider overrides", call_id=session.call_id, exc_info=True)
 
+        # Resolve output downsampling for this call. Provider instances are
+        # call-owned, so concurrent Agents can safely select different profiles
+        # without mutating a shared provider template.
+        try:
+            transport = getattr(session, "transport_profile", None)
+            if transport:
+                provider_mode = (
+                    cfg.get("output_resampler", "inherit")
+                    if isinstance(cfg, dict)
+                    else getattr(cfg, "output_resampler", "inherit")
+                )
+                env_name = getattr(
+                    provider, "_output_resampler_environment_variable", None
+                )
+                mode, source = resolve_output_resampler_policy(
+                    profile_mode=getattr(transport, "output_resampler", "linear"),
+                    provider_mode=provider_mode,
+                    environment_mode=os.getenv(env_name) if env_name else None,
+                )
+                previous_mode = getattr(provider, "_output_resampler_mode", None)
+                provider._output_resampler_mode = mode
+                provider._output_resampler_source = source
+                if previous_mode != mode:
+                    for state_name in (
+                        "_output_resample_state",
+                        "_resample_state_out",
+                    ):
+                        if hasattr(provider, state_name):
+                            setattr(provider, state_name, None)
+                if hasattr(provider, "_output_resampler_logged"):
+                    provider._output_resampler_logged = False
+                logger.info(
+                    "Output resampler policy resolved",
+                    call_id=session.call_id,
+                    provider=getattr(session, "provider_name", None),
+                    profile=getattr(transport, "profile_name", None),
+                    mode=mode,
+                    source=source,
+                )
+        except Exception:
+            logger.warning(
+                "Failed resolving per-call output resampler; retaining compatibility mode",
+                call_id=session.call_id,
+                exc_info=True,
+            )
+            provider._output_resampler_mode = "linear"
+            provider._output_resampler_source = "resolution-error-fallback"
+
         # LocalProvider uses an explicit initial greeting helper.
         try:
             if greeting and hasattr(provider, "set_initial_greeting"):
                 provider.set_initial_greeting(greeting)
         except Exception:
             logger.debug("Provider set_initial_greeting failed", call_id=session.call_id, exc_info=True)
+
+    def _resample_full_agent_output(
+        self,
+        *,
+        call_id: str,
+        session: CallSession,
+        chunk: bytes,
+        encoding: str,
+        source_rate: int,
+        target_rate: int,
+    ) -> Tuple[bytes, int]:
+        """Convert full-agent PCM to the per-call wire rate using its resolved policy."""
+        canonical = self._canonicalize_encoding(encoding)
+        if (
+            canonical not in {"linear16", "pcm16", "slin", "slin16"}
+            or source_rate <= 0
+            or target_rate <= 0
+            or source_rate == target_rate
+        ):
+            return chunk, source_rate
+
+        call_providers = getattr(self, "_call_providers", None) or {}
+        provider = call_providers.get(call_id)
+        transport = getattr(session, "transport_profile", None)
+        mode = getattr(
+            provider,
+            "_output_resampler_mode",
+            getattr(transport, "output_resampler", "linear"),
+        )
+        source = getattr(provider, "_output_resampler_source", "profile-fallback")
+        state = self._resample_state_provider_out.get(call_id)
+        first_chunk = state is None
+        converted, state = resample_audio(
+            chunk,
+            source_rate,
+            target_rate,
+            state=state,
+            mode=mode,
+        )
+        self._resample_state_provider_out[call_id] = state
+
+        if first_chunk:
+            logger.info(
+                "Full-agent output resampler selected",
+                call_id=call_id,
+                provider=getattr(session, "provider_name", None),
+                profile=getattr(transport, "profile_name", None),
+                configured_mode=mode,
+                active_mode=mode,
+                policy_source=source,
+                source_rate=source_rate,
+                target_rate=target_rate,
+                alias_safe=(mode == "bandlimited" and source_rate > target_rate),
+            )
+        return converted, target_rate
 
     async def _start_provider_session(self, call_id: str) -> None:
         """Start the provider session for a call when media path is ready."""

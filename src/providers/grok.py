@@ -23,6 +23,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import time
 import uuid
 import audioop
@@ -40,6 +41,7 @@ from ..audio import (
     convert_pcm16le_to_target_format,
     mulaw_to_pcm16le,
     resample_audio,
+    resolve_output_resampler_policy,
 )
 from ..config import GrokProviderConfig
 
@@ -167,6 +169,25 @@ class GrokProvider(AIProviderInterface):
 
         self._input_resample_state: Optional[tuple] = None
         self._output_resample_state: Optional[tuple] = None
+        self._output_resampler_environment_variable = "AAVA_GROK_OUTPUT_RESAMPLER"
+        configured_output_resampler, output_resampler_source = (
+            resolve_output_resampler_policy(
+                profile_mode="linear",
+                provider_mode=getattr(config, "output_resampler", "inherit"),
+                environment_mode=os.getenv(
+                    self._output_resampler_environment_variable
+                ),
+            )
+        )
+        if output_resampler_source.endswith("invalid-fallback"):
+            logger.warning(
+                "Invalid Grok output resampler; using compatibility default",
+                source=output_resampler_source,
+                fallback="linear",
+            )
+        self._output_resampler_mode = configured_output_resampler
+        self._output_resampler_source = output_resampler_source
+        self._output_resampler_logged = False
         self._transcript_buffer: str = ""
         self._input_info_logged: bool = False
         self._allowed_tools: Optional[List[str]] = None
@@ -400,6 +421,7 @@ class GrokProvider(AIProviderInterface):
         self._first_output_chunk_logged = False
         self._input_resample_state = None
         self._output_resample_state = None
+        self._output_resampler_logged = False
         self._transcript_buffer = ""
         self._closing = False
         self._closed = False
@@ -1487,6 +1509,8 @@ class GrokProvider(AIProviderInterface):
         except Exception:
             logger.debug("Failed stopping Grok provider pacer on local barge-in", call_id=self._call_id, exc_info=True)
         self._in_audio_burst = False
+        self._output_resample_state = None
+        self._output_resampler_logged = False
         logger.info(
             "Flushed Grok provider egress on local barge-in",
             call_id=self._call_id,
@@ -2459,7 +2483,24 @@ class GrokProvider(AIProviderInterface):
                 source_rate,
                 target_rate,
                 state=self._output_resample_state,
+                mode=self._output_resampler_mode,
             )
+            if not self._output_resampler_logged:
+                alias_safe = bool(
+                    self._output_resampler_mode == "bandlimited"
+                    and source_rate > target_rate
+                    and source_rate % target_rate == 0
+                )
+                logger.info(
+                    "Grok output resampler selected",
+                    call_id=self._call_id,
+                    configured_mode=self._output_resampler_mode,
+                    active_mode=("bandlimited" if alias_safe else "linear"),
+                    source_rate_hz=source_rate,
+                    target_rate_hz=target_rate,
+                    alias_safe=alias_safe,
+                )
+                self._output_resampler_logged = True
 
             outbound = convert_pcm16le_to_target_format(pcm_target, self.config.target_encoding)
             if not outbound:
@@ -2524,6 +2565,7 @@ class GrokProvider(AIProviderInterface):
             except Exception:
                 logger.debug("Failed to pause pacer on AgentAudioDone", call_id=self._call_id, exc_info=True)
             self._output_resample_state = None
+            self._output_resampler_logged = False
             self._first_output_chunk_logged = False
 
         # If a hangup was requested and we just finished emitting the farewell audio, trigger hangup now.
